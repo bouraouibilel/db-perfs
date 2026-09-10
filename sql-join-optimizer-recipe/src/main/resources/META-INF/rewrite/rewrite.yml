@@ -1,0 +1,7 @@
+---
+type: specs.openrewrite.org/v1beta/recipe
+name: com.example.DetectUnusedSqlJoins
+displayName: Détecter les jointures SQL et colonnes non consommées dans le code Java
+description: Analyse les requêtes SQL et leur consommation dans les modules Java pour identifier les jointures et projections superflues.
+recipeList:
+  - com.example.rewrite.sql.DetectUnusedSqlJoinsRecipe
