@@ -352,5 +352,68 @@ class DetectUnusedSqlJoinsRecipeTest implements RewriteTest {
             )
         );
     }
+
+    @Test
+    void shouldDetectUnusedJoinInSqlConstantClass() {
+        rewriteRun(
+            // Classe de constantes dans utilities-commun
+            java(
+                """
+                package com.example.util;
+
+                public class QueryConstants {
+                    public static final String REQ_FIND_USERS =
+                        "SELECT u.id AS id, u.name AS name, a.city AS city " +
+                        "FROM users u " +
+                        "LEFT JOIN address a ON u.address_id = a.id";
+                }
+                """,
+                """
+                package com.example.util;
+
+                public class QueryConstants {
+                    /*~~([CANDIDAT_SUR_BATCH] Jointure inutile 'address' (LEFT JOIN) : aucune colonne lue dans le code des modules batchs appelants [batch-billing].)~~>*/public static final String REQ_FIND_USERS =
+                        "SELECT u.id AS id, u.name AS name, a.city AS city " +
+                        "FROM users u " +
+                        "LEFT JOIN address a ON u.address_id = a.id";
+                }
+                """,
+                spec -> spec.path("utilities-commun/src/main/java/com/example/util/QueryConstants.java")
+            ),
+            // Modèle DTO
+            java(
+                """
+                package com.example.dto;
+
+                public class UserDto {
+                    private Long id;
+                    private String name;
+                    private String city;
+
+                    public Long getId() { return id; }
+                    public String getName() { return name; }
+                    public String getCity() { return city; }
+                }
+                """,
+                spec -> spec.path("core-common/src/main/java/com/example/dto/UserDto.java")
+            ),
+            // Consommateur dans un batch qui utilise la constante mais ne lit pas getCity
+            java(
+                """
+                package com.example.batch;
+                import com.example.util.QueryConstants;
+                import com.example.dto.UserDto;
+
+                public class BillingJob {
+                    public void run(UserDto dto) {
+                        String sql = QueryConstants.REQ_FIND_USERS;
+                        System.out.println(dto.getId() + " " + dto.getName());
+                    }
+                }
+                """,
+                spec -> spec.path("batch-billing/src/main/java/com/example/batch/BillingJob.java")
+            )
+        );
+    }
 }
 

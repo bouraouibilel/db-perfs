@@ -176,7 +176,39 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                 }
             }
 
-            // 2. Détection des méthodes de repository avec @Query
+            // 2. Détection des variables constantes String contenant du SQL (ex: public static final String REQ_... = "SELECT ...")
+            @Override
+            public J.VariableDeclarations visitVariableDeclarations(J.VariableDeclarations multiVariable, ExecutionContext ctx) {
+                J.VariableDeclarations vd = super.visitVariableDeclarations(multiVariable, ctx);
+                J.ClassDeclaration parentClass = getCursor().firstEnclosing(J.ClassDeclaration.class);
+                String declaringClassFqn = parentClass != null && parentClass.getType() != null ? parentClass.getType().getFullyQualifiedName() : "UnknownClass";
+
+                for (J.VariableDeclarations.NamedVariable var : vd.getVariables()) {
+                    if (var.getInitializer() != null) {
+                        String sql = extractLiteralString(var.getInitializer());
+                        if (sql != null && isSqlSelectQuery(sql)) {
+                            String varName = var.getSimpleName();
+                            String moduleName = resolveModuleName();
+                            SourceFile sf = getCursor().firstEnclosing(SourceFile.class);
+                            String sourcePath = sf != null ? sf.getSourcePath().toString() : "";
+
+                            QueryMetadata queryMetadata = new QueryMetadata(
+                                    sql,
+                                    declaringClassFqn,
+                                    declaringClassFqn,
+                                    varName,
+                                    moduleName,
+                                    sourcePath,
+                                    0
+                            );
+                            acc.registerQuery(queryMetadata);
+                        }
+                    }
+                }
+                return vd;
+            }
+
+            // 3. Détection des méthodes de repository avec @Query
             @Override
             public J.MethodDeclaration visitMethodDeclaration(J.MethodDeclaration method, ExecutionContext ctx) {
                 J.MethodDeclaration md = super.visitMethodDeclaration(method, ctx);
@@ -208,7 +240,7 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                 return md;
             }
 
-            // 3. Détection de tous les appels de méthodes (getters + invocations de requêtes)
+            // 4. Détection de tous les appels de méthodes (getters + invocations de requêtes)
             @Override
             public J.MethodInvocation visitMethodInvocation(J.MethodInvocation method, ExecutionContext ctx) {
                 J.MethodInvocation m = super.visitMethodInvocation(method, ctx);
@@ -231,6 +263,32 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                     }
                 }
                 return m;
+            }
+
+            // 5. Détection de l'accès aux constantes de requêtes (ex: RequetesConstantes.REQ_FIND_USERS)
+            @Override
+            public J.FieldAccess visitFieldAccess(J.FieldAccess fieldAccess, ExecutionContext ctx) {
+                J.FieldAccess fa = super.visitFieldAccess(fieldAccess, ctx);
+                if (fa.getName() != null) {
+                    String fieldName = fa.getName().getSimpleName();
+                    acc.registerNamedQueryCall(fieldName, resolveModuleName());
+                    if (fa.getTarget() instanceof J.Identifier) {
+                        String className = ((J.Identifier) fa.getTarget()).getSimpleName();
+                        acc.registerQueryCall(className + "#" + fieldName, resolveModuleName());
+                    }
+                }
+                return fa;
+            }
+
+            // Support si la constante est importée statiquement (import static ...REQ_FIND_USERS)
+            @Override
+            public J.Identifier visitIdentifier(J.Identifier identifier, ExecutionContext ctx) {
+                J.Identifier id = super.visitIdentifier(identifier, ctx);
+                String name = id.getSimpleName();
+                if (name != null && acc.registeredNamedQueries.containsKey(name)) {
+                    acc.registerNamedQueryCall(name, resolveModuleName());
+                }
+                return id;
             }
         };
     }
@@ -391,6 +449,26 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
             }
 
             @Override
+            public J.VariableDeclarations visitVariableDeclarations(J.VariableDeclarations multiVariable, ExecutionContext ctx) {
+                J.VariableDeclarations vd = super.visitVariableDeclarations(multiVariable, ctx);
+                J.ClassDeclaration parentClass = getCursor().firstEnclosing(J.ClassDeclaration.class);
+                String declaringClassFqn = parentClass != null && parentClass.getType() != null ? parentClass.getType().getFullyQualifiedName() : "UnknownClass";
+
+                for (J.VariableDeclarations.NamedVariable var : vd.getVariables()) {
+                    String varName = var.getSimpleName();
+                    String key = declaringClassFqn + "#" + varName;
+                    QueryMetadata qm = acc.registeredQueries.get(key);
+                    if (qm == null) {
+                        qm = acc.registeredNamedQueries.get(varName);
+                    }
+                    if (qm != null) {
+                        vd = analyzeAndMarkQuery(qm, vd, ctx);
+                    }
+                }
+                return vd;
+            }
+
+            @Override
             public J.MethodDeclaration visitMethodDeclaration(J.MethodDeclaration method, ExecutionContext ctx) {
                 J.MethodDeclaration md = super.visitMethodDeclaration(method, ctx);
                 if (md.getMethodType() == null || md.getMethodType().getDeclaringType() == null) {
@@ -406,6 +484,12 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                 return analyzeAndMarkQuery(queryMetadata, md, ctx);
             }
         };
+    }
+
+    private static boolean isSqlSelectQuery(String str) {
+        if (str == null) return false;
+        String trimmed = str.trim().toUpperCase();
+        return trimmed.startsWith("SELECT") && trimmed.contains("FROM");
     }
 
     private static synchronized void exportReportToConsoleAndFile(SqlJoinReport.Row row) {
