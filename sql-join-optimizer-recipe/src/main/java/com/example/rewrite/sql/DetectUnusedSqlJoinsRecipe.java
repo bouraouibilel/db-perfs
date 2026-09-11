@@ -697,7 +697,41 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
         return trimmed.startsWith("SELECT") && trimmed.contains("FROM");
     }
 
+    private static final Set<String> loggedRowKeys = Collections.synchronizedSet(new HashSet<>());
+    private static volatile boolean reportFilesInitialized = false;
+
+    private static synchronized void initReportFilesOnce() {
+        if (!reportFilesInitialized) {
+            reportFilesInitialized = true;
+            try {
+                java.nio.file.Path targetDir = java.nio.file.Path.of("target");
+                java.nio.file.Files.createDirectories(targetDir);
+
+                java.nio.file.Path mdPath = targetDir.resolve("sql-optimization-report.md");
+                StringBuilder mdContent = new StringBuilder();
+                mdContent.append("# Rapport d'optimisation des requêtes SQL et Jointures\n\n");
+                mdContent.append("| Méthode | Table jointe | Type | Colonnes orphelines | Statut | Recommandation |\n");
+                mdContent.append("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+                java.nio.file.Files.writeString(mdPath, mdContent.toString(),
+                        java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.TRUNCATE_EXISTING);
+
+                java.nio.file.Path csvPath = targetDir.resolve("sql-optimization-report.csv");
+                String csvHeader = "Fichier,Methode,TableJointe,TypeJointe,ColonnesNonLues,Statut,Message\n";
+                java.nio.file.Files.writeString(csvPath, csvHeader,
+                        java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.TRUNCATE_EXISTING);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
     private static synchronized void exportReportToConsoleAndFile(SqlJoinReport.Row row) {
+        String deduplicationKey = row.queryMethod() + "#" + row.joinTable() + "#" + row.status();
+        if (!loggedRowKeys.add(deduplicationKey)) {
+            return; // Ligne déjà exportée, évite les doublons inter-modules
+        }
+
+        initReportFilesOnce();
+
         System.out.println(String.format(
             "\n[SQL-JOIN-OPTIMIZER] ----------------------------------------------------" +
             "\n  Statut   : [%s]" +
@@ -713,33 +747,19 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
 
         try {
             java.nio.file.Path targetDir = java.nio.file.Path.of("target");
-            java.nio.file.Files.createDirectories(targetDir);
-
             java.nio.file.Path mdPath = targetDir.resolve("sql-optimization-report.md");
-            boolean mdExists = java.nio.file.Files.exists(mdPath);
-            StringBuilder mdContent = new StringBuilder();
-            if (!mdExists) {
-                mdContent.append("# Rapport d'optimisation des requêtes SQL et Jointures\n\n");
-                mdContent.append("| Méthode | Table jointe | Type | Colonnes orphelines | Statut | Recommandation |\n");
-                mdContent.append("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
-            }
-            mdContent.append(String.format("| `%s` | `%s` | %s | `%s` | **%s** | %s |\n",
+            String mdLine = String.format("| `%s` | `%s` | %s | `%s` | **%s** | %s |\n",
                     row.queryMethod(), row.joinTable(), row.joinType(),
                     row.unusedColumns().isBlank() ? "-" : row.unusedColumns(),
-                    row.status(), row.message()));
-            java.nio.file.Files.writeString(mdPath, mdContent.toString(),
+                    row.status(), row.message());
+            java.nio.file.Files.writeString(mdPath, mdLine,
                     java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
 
             java.nio.file.Path csvPath = targetDir.resolve("sql-optimization-report.csv");
-            boolean csvExists = java.nio.file.Files.exists(csvPath);
-            StringBuilder csvContent = new StringBuilder();
-            if (!csvExists) {
-                csvContent.append("Fichier,Methode,TableJointe,TypeJointe,ColonnesNonLues,Statut,Message\n");
-            }
-            csvContent.append(String.format("\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n",
+            String csvLine = String.format("\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n",
                     row.sourceFile(), row.queryMethod(), row.joinTable(), row.joinType(),
-                    row.unusedColumns(), row.status(), row.message().replace("\"", "'")));
-            java.nio.file.Files.writeString(csvPath, csvContent.toString(),
+                    row.unusedColumns(), row.status(), row.message().replace("\"", "'"));
+            java.nio.file.Files.writeString(csvPath, csvLine,
                     java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
 
         } catch (Exception ignored) {

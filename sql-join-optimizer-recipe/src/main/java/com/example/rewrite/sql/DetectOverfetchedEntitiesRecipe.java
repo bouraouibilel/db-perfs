@@ -1,6 +1,7 @@
 package com.example.rewrite.sql;
 
 import com.example.rewrite.sql.model.QueryMetadata;
+import com.example.rewrite.sql.parser.SqlSelectAnalyzer;
 import com.example.rewrite.sql.report.EntityOverfetchingReport;
 import org.openrewrite.*;
 import org.openrewrite.internal.lang.Nullable;
@@ -15,6 +16,9 @@ import java.util.stream.Collectors;
 public class DetectOverfetchedEntitiesRecipe extends ScanningRecipe<MultiModuleUsageAccumulator> {
 
     private final transient EntityOverfetchingReport report = new EntityOverfetchingReport(this);
+
+    private static final Set<String> loggedRowKeys = Collections.synchronizedSet(new HashSet<>());
+    private static volatile boolean reportFilesInitialized = false;
 
     public DetectOverfetchedEntitiesRecipe() {
     }
@@ -68,6 +72,7 @@ public class DetectOverfetchedEntitiesRecipe extends ScanningRecipe<MultiModuleU
                 return super.visitCompilationUnit(cu, ctx);
             }
 
+            // 1. Enregistrement de tous les attributs déclarés dans chaque classe
             @Override
             public J.ClassDeclaration visitClassDeclaration(J.ClassDeclaration classDecl, ExecutionContext ctx) {
                 J.ClassDeclaration cd = super.visitClassDeclaration(classDecl, ctx);
@@ -85,12 +90,44 @@ public class DetectOverfetchedEntitiesRecipe extends ScanningRecipe<MultiModuleU
                 return cd;
             }
 
+            // 2. Détection des constantes String SQL (ex: public static final String REQ_... = "SELECT ...")
+            @Override
+            public J.VariableDeclarations visitVariableDeclarations(J.VariableDeclarations multiVariable, ExecutionContext ctx) {
+                J.VariableDeclarations vd = super.visitVariableDeclarations(multiVariable, ctx);
+                J.ClassDeclaration parentClass = getCursor().firstEnclosing(J.ClassDeclaration.class);
+                String declaringClassFqn = parentClass != null && parentClass.getType() != null ? parentClass.getType().getFullyQualifiedName() : "UnknownClass";
+
+                for (J.VariableDeclarations.NamedVariable var : vd.getVariables()) {
+                    if (var.getInitializer() != null) {
+                        String sql = extractLiteralString(var.getInitializer());
+                        if (sql != null && isSqlSelectQuery(sql)) {
+                            String varName = var.getSimpleName();
+                            String moduleName = resolveModuleName();
+                            SourceFile sf = getCursor().firstEnclosing(SourceFile.class);
+                            String sourcePath = sf != null ? sf.getSourcePath().toString() : "";
+
+                            acc.registerQuery(new QueryMetadata(
+                                    sql,
+                                    declaringClassFqn,
+                                    declaringClassFqn,
+                                    varName,
+                                    moduleName,
+                                    sourcePath,
+                                    0
+                            ));
+                        }
+                    }
+                }
+                return vd;
+            }
+
+            // 3. Détection des méthodes de repository avec @Query
             @Override
             public J.MethodDeclaration visitMethodDeclaration(J.MethodDeclaration method, ExecutionContext ctx) {
                 J.MethodDeclaration md = super.visitMethodDeclaration(method, ctx);
                 for (J.Annotation annotation : md.getLeadingAnnotations()) {
                     if ("Query".equals(annotation.getSimpleName()) && annotation.getArguments() != null) {
-                        String sql = extractLiteral(annotation.getArguments().get(0));
+                        String sql = extractLiteralString(annotation.getArguments().get(0));
                         JavaType.Method methodType = md.getMethodType();
                         if (sql != null && methodType != null && methodType.getDeclaringType() != null) {
                             String returnTypeFqn = unwrapGenericType(methodType.getReturnType());
@@ -112,6 +149,7 @@ public class DetectOverfetchedEntitiesRecipe extends ScanningRecipe<MultiModuleU
                 return md;
             }
 
+            // 4. Détection des appels de méthodes (getters) et des appels createQuery(sql, MonEntite.class)
             @Override
             public J.MethodInvocation visitMethodInvocation(J.MethodInvocation method, ExecutionContext ctx) {
                 J.MethodInvocation m = super.visitMethodInvocation(method, ctx);
@@ -119,6 +157,32 @@ public class DetectOverfetchedEntitiesRecipe extends ScanningRecipe<MultiModuleU
                     String declaringTypeFqn = m.getMethodType().getDeclaringType().getFullyQualifiedName();
                     String methodName = m.getSimpleName();
                     acc.registerInvocation(declaringTypeFqn, methodName);
+
+                    // Si on rencontre entityManager.createQuery(CONSTANTE, MonEntite.class)
+                    if (("createQuery".equals(methodName) || "createNamedQuery".equals(methodName))
+                            && m.getArguments() != null && m.getArguments().size() >= 2) {
+                        Expression queryArg = m.getArguments().get(0);
+                        Expression entityClassArg = m.getArguments().get(1);
+
+                        String queryIdentifier = extractIdentifierName(queryArg);
+                        String targetEntityFqn = extractClassLiteralFqn(entityClassArg);
+
+                        if (queryIdentifier != null && targetEntityFqn != null) {
+                            QueryMetadata qm = acc.registeredNamedQueries.get(queryIdentifier);
+                            if (qm != null) {
+                                // Mettre à jour avec le vrai type d'entité ciblé par le createQuery
+                                acc.registerQuery(new QueryMetadata(
+                                        qm.rawQuery(),
+                                        targetEntityFqn,
+                                        qm.declaringClassFqn(),
+                                        qm.methodName(),
+                                        qm.sourceModule(),
+                                        qm.sourcePath(),
+                                        qm.lineNumber()
+                                ));
+                            }
+                        }
+                    }
                 }
                 return m;
             }
@@ -130,6 +194,7 @@ public class DetectOverfetchedEntitiesRecipe extends ScanningRecipe<MultiModuleU
         System.out.println("\n[ENTITY-OVERFETCHING-DETECTOR] ========================================");
         System.out.println("  Analyse de l'over-fetching sur les entités/DTOs...");
         System.out.println("  Classes référencées avec propriétés : " + acc.knownEntityProperties.size());
+        System.out.println("  Requêtes répertoriées               : " + acc.registeredQueries.size());
         System.out.println("[ENTITY-OVERFETCHING-DETECTOR] ========================================\n");
         return Collections.emptyList();
     }
@@ -147,15 +212,46 @@ public class DetectOverfetchedEntitiesRecipe extends ScanningRecipe<MultiModuleU
 
                 String queryKey = md.getMethodType().getDeclaringType().getFullyQualifiedName() + "#" + md.getSimpleName();
                 QueryMetadata queryMetadata = acc.registeredQueries.get(queryKey);
-                if (queryMetadata == null) {
-                    return md;
+                if (queryMetadata != null) {
+                    md = checkAndReportOverfetching(queryMetadata, md, ctx);
+                }
+                return md;
+            }
+
+            @Override
+            public J.VariableDeclarations visitVariableDeclarations(J.VariableDeclarations multiVariable, ExecutionContext ctx) {
+                J.VariableDeclarations vd = super.visitVariableDeclarations(multiVariable, ctx);
+                J.ClassDeclaration parentClass = getCursor().firstEnclosing(J.ClassDeclaration.class);
+                String declaringClassFqn = parentClass != null && parentClass.getType() != null ? parentClass.getType().getFullyQualifiedName() : "UnknownClass";
+
+                for (J.VariableDeclarations.NamedVariable var : vd.getVariables()) {
+                    String varName = var.getSimpleName();
+                    String key = declaringClassFqn + "#" + varName;
+                    QueryMetadata qm = acc.registeredQueries.get(key);
+                    if (qm == null) {
+                        qm = acc.registeredNamedQueries.get(varName);
+                    }
+                    if (qm != null) {
+                        vd = checkAndReportOverfetching(qm, vd, ctx);
+                    }
+                }
+                return vd;
+            }
+
+            private <T extends J> T checkAndReportOverfetching(QueryMetadata queryMetadata, T targetAstNode, ExecutionContext ctx) {
+                String returnTypeFqn = queryMetadata.returnTypeFqn();
+
+                // Si le type retourné est inconnu ou non résolu, essayer de le déduire du FROM de la requête
+                if ("void".equals(returnTypeFqn) || returnTypeFqn.equals(queryMetadata.declaringClassFqn())) {
+                    String resolvedFromTable = resolveEntityFromQuery(queryMetadata.rawQuery(), acc.knownEntityProperties.keySet());
+                    if (resolvedFromTable != null) {
+                        returnTypeFqn = resolvedFromTable;
+                    }
                 }
 
-                String returnTypeFqn = queryMetadata.returnTypeFqn();
                 Set<String> declaredProps = acc.knownEntityProperties.get(returnTypeFqn);
                 if (declaredProps == null || declaredProps.size() <= 2) {
-                    // Pas assez de propriétés pour qualifier un overfetching significatif
-                    return md;
+                    return targetAstNode;
                 }
 
                 List<String> usedProps = new ArrayList<>();
@@ -169,7 +265,7 @@ public class DetectOverfetchedEntitiesRecipe extends ScanningRecipe<MultiModuleU
                     }
                 }
 
-                // Si au moins un tiers des propriétés ne sont JAMAIS lues
+                // S'il y a des propriétés lues et au moins 2 propriétés non lues
                 if (!usedProps.isEmpty() && unusedProps.size() >= 2 && usedProps.size() < declaredProps.size()) {
                     String shortEntityName = returnTypeFqn.contains(".") ?
                             returnTypeFqn.substring(returnTypeFqn.lastIndexOf('.') + 1) : returnTypeFqn;
@@ -182,7 +278,7 @@ public class DetectOverfetchedEntitiesRecipe extends ScanningRecipe<MultiModuleU
                     );
 
                     SourceFile sf = getCursor().firstEnclosing(SourceFile.class);
-                    String sourcePath = sf != null ? sf.getSourcePath().toString() : "";
+                    String sourcePath = sf != null ? sf.getSourcePath().toString() : queryMetadata.sourcePath();
 
                     EntityOverfetchingReport.Row row = new EntityOverfetchingReport.Row(
                             sourcePath,
@@ -198,15 +294,66 @@ public class DetectOverfetchedEntitiesRecipe extends ScanningRecipe<MultiModuleU
                     report.insertRow(ctx, row);
                     exportReport(row);
 
-                    md = SearchResult.found(md, "[" + status + "] " + recommendation);
+                    return SearchResult.found(targetAstNode, "[" + status + "] " + recommendation);
                 }
 
-                return md;
+                return targetAstNode;
             }
         };
     }
 
+    private static String resolveEntityFromQuery(String sql, Set<String> knownEntities) {
+        if (sql == null || knownEntities.isEmpty()) return null;
+        try {
+            var analysisOpt = SqlSelectAnalyzer.analyze(sql);
+            if (analysisOpt.isPresent()) {
+                String mainTable = analysisOpt.get().mainTable();
+                if (mainTable != null && !mainTable.isBlank()) {
+                    for (String entityFqn : knownEntities) {
+                        String simpleName = entityFqn.contains(".") ? entityFqn.substring(entityFqn.lastIndexOf('.') + 1) : entityFqn;
+                        if (simpleName.equalsIgnoreCase(mainTable)) {
+                            return entityFqn;
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private static synchronized void initReportFilesOnce() {
+        if (!reportFilesInitialized) {
+            reportFilesInitialized = true;
+            try {
+                java.nio.file.Path targetDir = java.nio.file.Path.of("target");
+                java.nio.file.Files.createDirectories(targetDir);
+
+                java.nio.file.Path mdPath = targetDir.resolve("entity-overfetching-report.md");
+                StringBuilder md = new StringBuilder();
+                md.append("# Rapport d'optimisation : Over-fetching d'Entités et Projections DTO\n\n");
+                md.append("| Requête | Entité | Consommés | Total | Attributs consommés | Inutilisés | Recommandation |\n");
+                md.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n");
+                java.nio.file.Files.writeString(mdPath, md.toString(),
+                        java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.TRUNCATE_EXISTING);
+
+                java.nio.file.Path csvPath = targetDir.resolve("entity-overfetching-report.csv");
+                String csvHeader = "Fichier,Requete,Entite,NbConsommes,NbTotal,AttributsConsommes,AttributsInutilises,Statut,Recommandation\n";
+                java.nio.file.Files.writeString(csvPath, csvHeader,
+                        java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.TRUNCATE_EXISTING);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
     private static synchronized void exportReport(EntityOverfetchingReport.Row row) {
+        String deduplicationKey = row.queryIdentifier() + "#" + row.entityClass() + "#" + row.usedProperties();
+        if (!loggedRowKeys.add(deduplicationKey)) {
+            return;
+        }
+
+        initReportFilesOnce();
+
         System.out.println(String.format(
                 "\n[OVERFETCHING-DETECTOR] --------------------------------------------------" +
                 "\n  Statut         : [%s]" +
@@ -223,48 +370,75 @@ public class DetectOverfetchedEntitiesRecipe extends ScanningRecipe<MultiModuleU
 
         try {
             java.nio.file.Path targetDir = java.nio.file.Path.of("target");
-            java.nio.file.Files.createDirectories(targetDir);
-
             java.nio.file.Path mdPath = targetDir.resolve("entity-overfetching-report.md");
-            boolean mdExists = java.nio.file.Files.exists(mdPath);
-            StringBuilder md = new StringBuilder();
-            if (!mdExists) {
-                md.append("# Rapport d'optimisation : Over-fetching d'Entités et Projections DTO\n\n");
-                md.append("| Requête | Entité | Consommés | Total | Attributs consommés | Inutilisés | Recommandation |\n");
-                md.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n");
-            }
-            md.append(String.format("| `%s` | `%s` | %d | %d | `%s` | `%s` | %s |\n",
+            String mdLine = String.format("| `%s` | `%s` | %d | %d | `%s` | `%s` | %s |\n",
                     row.queryIdentifier(), row.entityClass(),
                     row.usedPropertiesCount(), row.totalPropertiesCount(),
-                    row.usedProperties(), row.unusedProperties(), row.recommendation()));
-            java.nio.file.Files.writeString(mdPath, md.toString(),
+                    row.usedProperties(), row.unusedProperties(), row.recommendation());
+            java.nio.file.Files.writeString(mdPath, mdLine,
                     java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
 
             java.nio.file.Path csvPath = targetDir.resolve("entity-overfetching-report.csv");
-            boolean csvExists = java.nio.file.Files.exists(csvPath);
-            StringBuilder csv = new StringBuilder();
-            if (!csvExists) {
-                csv.append("Fichier,Requete,Entite,NbConsommes,NbTotal,AttributsConsommes,AttributsInutilises,Statut,Recommandation\n");
-            }
-            csv.append(String.format("\"%s\",\"%s\",\"%s\",%d,%d,\"%s\",\"%s\",\"%s\",\"%s\"\n",
+            String csvLine = String.format("\"%s\",\"%s\",\"%s\",%d,%d,\"%s\",\"%s\",\"%s\",\"%s\"\n",
                     row.sourceFile(), row.queryIdentifier(), row.entityClass(),
                     row.usedPropertiesCount(), row.totalPropertiesCount(),
                     row.usedProperties(), row.unusedProperties(),
-                    row.status(), row.recommendation().replace("\"", "'")));
-            java.nio.file.Files.writeString(csvPath, csv.toString(),
+                    row.status(), row.recommendation().replace("\"", "'"));
+            java.nio.file.Files.writeString(csvPath, csvLine,
                     java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
         } catch (Exception ignored) {
         }
     }
 
     @Nullable
-    private static String extractLiteral(Expression expr) {
+    private static String extractIdentifierName(Expression expr) {
+        if (expr instanceof J.Identifier) {
+            return ((J.Identifier) expr).getSimpleName();
+        } else if (expr instanceof J.FieldAccess) {
+            return ((J.FieldAccess) expr).getName().getSimpleName();
+        } else if (expr instanceof J.Literal) {
+            return extractLiteralString(expr);
+        }
+        return null;
+    }
+
+    @Nullable
+    private static String extractClassLiteralFqn(Expression expr) {
+        if (expr instanceof J.FieldAccess) {
+            J.FieldAccess fa = (J.FieldAccess) expr;
+            if ("class".equals(fa.getName().getSimpleName())) {
+                if (fa.getTarget().getType() instanceof JavaType.Class) {
+                    return ((JavaType.Class) fa.getTarget().getType()).getFullyQualifiedName();
+                } else if (fa.getTarget() instanceof J.Identifier) {
+                    return ((J.Identifier) fa.getTarget()).getSimpleName();
+                }
+            }
+        }
+        return null;
+    }
+
+    private static boolean isSqlSelectQuery(String str) {
+        if (str == null) return false;
+        String trimmed = str.trim().toUpperCase();
+        return trimmed.startsWith("SELECT") && trimmed.contains("FROM");
+    }
+
+    @Nullable
+    private static String extractLiteralString(Expression expr) {
         if (expr instanceof J.Literal) {
             J.Literal lit = (J.Literal) expr;
             if (lit.getValue() instanceof String) return (String) lit.getValue();
         }
         if (expr instanceof J.Assignment) {
-            return extractLiteral(((J.Assignment) expr).getAssignment());
+            return extractLiteralString(((J.Assignment) expr).getAssignment());
+        }
+        if (expr instanceof J.Binary) {
+            J.Binary binary = (J.Binary) expr;
+            if (binary.getOperator() == J.Binary.Type.Addition) {
+                String left = extractLiteralString(binary.getLeft());
+                String right = extractLiteralString(binary.getRight());
+                if (left != null && right != null) return left + right;
+            }
         }
         return null;
     }
