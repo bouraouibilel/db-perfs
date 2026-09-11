@@ -42,8 +42,19 @@ public class MultiModuleUsageAccumulator {
      */
     public final Map<String, Set<String>> namedQueryCallersByModule = new HashMap<>();
 
+    /**
+     * Attributs / propriétés déclarés par chaque entité JPA ou DTO.
+     * Clé : FQN de la classe entité (ex: "fr.entrepabs.appli.entity.User") -> Ensemble de noms de propriétés {"id", "nom", "prenom", ...}
+     */
+    public final Map<String, Set<String>> knownEntityProperties = new HashMap<>();
+
     public int scannedFileCount = 0;
     public final Set<String> scannedModules = new TreeSet<>();
+
+    public void registerEntityProperty(String entityFqn, String propertyName) {
+        if (entityFqn == null || propertyName == null || propertyName.isBlank()) return;
+        knownEntityProperties.computeIfAbsent(entityFqn, k -> new TreeSet<>()).add(propertyName);
+    }
 
     public void registerInvocation(String typeFqn, String methodName) {
         if (typeFqn == null || methodName == null) return;

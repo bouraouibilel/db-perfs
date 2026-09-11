@@ -138,6 +138,19 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                     }
                 }
 
+                // Enregistrement des propriétés/champs de la classe (pour l'analyse d'over-fetching)
+                if (cd.getType() != null && cd.getBody() != null) {
+                    String classFqn = cd.getType().getFullyQualifiedName();
+                    for (Statement stmt : cd.getBody().getStatements()) {
+                        if (stmt instanceof J.VariableDeclarations) {
+                            J.VariableDeclarations vd = (J.VariableDeclarations) stmt;
+                            for (J.VariableDeclarations.NamedVariable nv : vd.getVariables()) {
+                                acc.registerEntityProperty(classFqn, nv.getSimpleName());
+                            }
+                        }
+                    }
+                }
+
                 // Détection des @NamedQuery / @NamedNativeQuery sur les classes/interfaces
                 for (J.Annotation annotation : cd.getLeadingAnnotations()) {
                     scanForNamedQueries(annotation, cd);
