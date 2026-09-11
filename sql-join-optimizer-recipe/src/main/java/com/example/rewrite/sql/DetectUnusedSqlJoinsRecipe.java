@@ -11,6 +11,8 @@ import org.openrewrite.internal.lang.Nullable;
 import org.openrewrite.java.JavaIsoVisitor;
 import org.openrewrite.java.tree.*;
 import org.openrewrite.marker.SearchResult;
+import org.openrewrite.xml.XmlIsoVisitor;
+import org.openrewrite.xml.tree.Xml;
 
 import java.nio.file.Path;
 import java.util.*;
@@ -65,6 +67,25 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
 
     @Override
     public TreeVisitor<?, ExecutionContext> getScanner(MultiModuleUsageAccumulator acc) {
+        return new TreeVisitor<Tree, ExecutionContext>() {
+            @Override
+            public boolean isAcceptable(SourceFile sourceFile, ExecutionContext ctx) {
+                return sourceFile instanceof J.CompilationUnit || sourceFile instanceof Xml.Document;
+            }
+
+            @Override
+            public Tree visit(@Nullable Tree tree, ExecutionContext ctx) {
+                if (tree instanceof J.CompilationUnit) {
+                    return javaScanner(acc).visit(tree, ctx);
+                } else if (tree instanceof Xml.Document) {
+                    return xmlScanner(acc).visit(tree, ctx);
+                }
+                return tree;
+            }
+        };
+    }
+
+    private TreeVisitor<?, ExecutionContext> javaScanner(MultiModuleUsageAccumulator acc) {
         return new JavaIsoVisitor<ExecutionContext>() {
 
             private String resolveModuleName() {
@@ -293,8 +314,104 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
         };
     }
 
+    private TreeVisitor<?, ExecutionContext> xmlScanner(MultiModuleUsageAccumulator acc) {
+        return new XmlIsoVisitor<ExecutionContext>() {
+
+            private String resolveModuleName() {
+                SourceFile sourceFile = getCursor().firstEnclosing(SourceFile.class);
+                if (sourceFile != null) {
+                    Path path = sourceFile.getSourcePath();
+                    if (path != null && path.getNameCount() > 0) {
+                        String firstPart = path.getName(0).toString();
+                        if (!"src".equalsIgnoreCase(firstPart)) {
+                            return firstPart;
+                        }
+                        String pathStr = path.toString().replace('\\', '/').toLowerCase();
+                        if (pathStr.contains("batch")) return "batch";
+                        if (pathStr.contains("web")) return "web";
+                        if (pathStr.contains("core") || pathStr.contains("common")) return "common";
+                        return firstPart;
+                    }
+                }
+                return "root";
+            }
+
+            @Override
+            public Xml.Document visitDocument(Xml.Document document, ExecutionContext ctx) {
+                acc.scannedFileCount++;
+                acc.scannedModules.add(resolveModuleName());
+                return super.visitDocument(document, ctx);
+            }
+
+            @Override
+            public Xml.Tag visitTag(Xml.Tag tag, ExecutionContext ctx) {
+                Xml.Tag t = super.visitTag(tag, ctx);
+                SourceFile sf = getCursor().firstEnclosing(SourceFile.class);
+                String sourcePath = sf != null ? sf.getSourcePath().toString() : "";
+                String moduleName = resolveModuleName();
+
+                // 1. Vérifier si un attribut de la balise contient une requête SQL (ex: <property name="sql" value="SELECT ..."/>)
+                if (t.getAttributes() != null) {
+                    for (Xml.Attribute attr : t.getAttributes()) {
+                        String val = attr.getValueAsString();
+                        if (val != null && isSqlSelectQuery(val)) {
+                            String queryName = t.getName() + "@" + attr.getKeyAsString();
+                            acc.registerQuery(new QueryMetadata(
+                                    val,
+                                    "void",
+                                    sourcePath,
+                                    queryName,
+                                    moduleName,
+                                    sourcePath,
+                                    0
+                            ));
+                        }
+                    }
+                }
+
+                // 2. Vérifier si le contenu texte ou CDATA de la balise contient une requête SQL
+                if (t.getValue().isPresent()) {
+                    String content = t.getValue().get();
+                    if (isSqlSelectQuery(content)) {
+                        String queryName = t.getName();
+                        acc.registerQuery(new QueryMetadata(
+                                content,
+                                "void",
+                                sourcePath,
+                                queryName,
+                                moduleName,
+                                sourcePath,
+                                0
+                        ));
+                    }
+                }
+
+                return t;
+            }
+        };
+    }
+
     @Override
     public TreeVisitor<?, ExecutionContext> getVisitor(MultiModuleUsageAccumulator acc) {
+        return new TreeVisitor<Tree, ExecutionContext>() {
+            @Override
+            public boolean isAcceptable(SourceFile sourceFile, ExecutionContext ctx) {
+                return sourceFile instanceof J.CompilationUnit || sourceFile instanceof Xml.Document;
+            }
+
+            @Override
+            public Tree visit(@Nullable Tree tree, ExecutionContext ctx) {
+                if (tree instanceof J.CompilationUnit) {
+                    return javaVisitor(acc).visit(tree, ctx);
+                } else if (tree instanceof Xml.Document) {
+                    return xmlVisitor(acc).visit(tree, ctx);
+                }
+                return tree;
+            }
+        };
+    }
+
+    private TreeVisitor<?, ExecutionContext> javaVisitor(MultiModuleUsageAccumulator acc) {
         return new JavaIsoVisitor<ExecutionContext>() {
 
             @Override
@@ -482,6 +599,81 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                 }
 
                 return analyzeAndMarkQuery(queryMetadata, md, ctx);
+            }
+        };
+    }
+
+    private TreeVisitor<?, ExecutionContext> xmlVisitor(MultiModuleUsageAccumulator acc) {
+        return new XmlIsoVisitor<ExecutionContext>() {
+            @Override
+            public Xml.Tag visitTag(Xml.Tag tag, ExecutionContext ctx) {
+                Xml.Tag t = super.visitTag(tag, ctx);
+                SourceFile sf = getCursor().firstEnclosing(SourceFile.class);
+                String sourcePath = sf != null ? sf.getSourcePath().toString() : "";
+
+                // Vérifier si un attribut contient une requête
+                if (t.getAttributes() != null) {
+                    for (Xml.Attribute attr : t.getAttributes()) {
+                        String val = attr.getValueAsString();
+                        if (val != null && isSqlSelectQuery(val)) {
+                            String queryName = t.getName() + "@" + attr.getKeyAsString();
+                            QueryMetadata qm = acc.registeredQueries.get(sourcePath + "#" + queryName);
+                            if (qm != null) {
+                                analyzeAndReportSql(qm, ctx);
+                            }
+                        }
+                    }
+                }
+
+                // Vérifier si le contenu de la balise contient une requête
+                if (t.getValue().isPresent()) {
+                    String content = t.getValue().get();
+                    if (isSqlSelectQuery(content)) {
+                        String queryName = t.getName();
+                        QueryMetadata qm = acc.registeredQueries.get(sourcePath + "#" + queryName);
+                        if (qm != null) {
+                            analyzeAndReportSql(qm, ctx);
+                        }
+                    }
+                }
+
+                return t;
+            }
+
+            private void analyzeAndReportSql(QueryMetadata qm, ExecutionContext ctx) {
+                Optional<JoinAnalysisResult> analysisOpt = SqlSelectAnalyzer.analyze(qm.rawQuery());
+                if (analysisOpt.isEmpty()) return;
+
+                JoinAnalysisResult analysis = analysisOpt.get();
+                for (JoinedTableInfo join : analysis.joins()) {
+                    String tableAliasOrName = join.getEffectiveIdentifier();
+
+                    boolean isUsedInFilters = analysis.tablesUsedInFiltersOrSorting().contains(tableAliasOrName);
+                    boolean isUsedInOtherJoinOn = analysis.joins().stream()
+                            .filter(other -> other != join)
+                            .anyMatch(other -> other.tablesMentionedInOnCondition().contains(tableAliasOrName));
+
+                    if (isUsedInFilters || isUsedInOtherJoinOn) continue;
+
+                    // Dans une config XML de batch, sans DTO typé direct, on signale la présence de la jointure
+                    String status = "CANDIDAT_SUR_BATCH";
+                    String message = String.format("Jointure XML batch '%s' (%s) potentiellement simplifiable : vérifier si les données de cette table sont réellement traitées par le job.",
+                            join.tableName(), join.joinType());
+
+                    SqlJoinReport.Row row = new SqlJoinReport.Row(
+                            qm.sourcePath(),
+                            0,
+                            qm.methodName(),
+                            join.tableName(),
+                            join.joinType(),
+                            status,
+                            "-",
+                            message,
+                            qm.rawQuery()
+                    );
+                    report.insertRow(ctx, row);
+                    exportReportToConsoleAndFile(row);
+                }
             }
         };
     }

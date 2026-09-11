@@ -21,6 +21,12 @@
         </dependency>
 
         <dependency>
+            <groupId>org.openrewrite</groupId>
+            <artifactId>rewrite-xml</artifactId>
+            <version>${rewrite.version}</version>
+        </dependency>
+
+        <dependency>
             <groupId>com.github.jsqlparser</groupId>
             <artifactId>jsqlparser</artifactId>
             <version>${jsqlparser.version}</version>
