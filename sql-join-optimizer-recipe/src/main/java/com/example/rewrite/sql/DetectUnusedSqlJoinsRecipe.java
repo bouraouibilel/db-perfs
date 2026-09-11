@@ -19,6 +19,10 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
 
     private final transient SqlJoinReport report = new SqlJoinReport(this);
 
+    public DetectUnusedSqlJoinsRecipe() {
+        System.out.println("[SQL-JOIN-OPTIMIZER] Recipe constructor invoked");
+    }
+
     public SqlJoinReport getReport() {
         return report;
     }
@@ -35,6 +39,7 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
 
     @Override
     public MultiModuleUsageAccumulator getInitialValue(ExecutionContext ctx) {
+        System.out.println("[SQL-JOIN-OPTIMIZER] getInitialValue invoked");
         return new MultiModuleUsageAccumulator();
     }
 
@@ -46,8 +51,16 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                 SourceFile sourceFile = getCursor().firstEnclosing(SourceFile.class);
                 if (sourceFile != null) {
                     Path path = sourceFile.getSourcePath();
-                    if (path != null && path.getNameCount() > 1) {
-                        return path.getName(0).toString();
+                    if (path != null && path.getNameCount() > 0) {
+                        String firstPart = path.getName(0).toString();
+                        if (!"src".equalsIgnoreCase(firstPart)) {
+                            return firstPart;
+                        }
+                        String pathStr = path.toString().replace('\\', '/').toLowerCase();
+                        if (pathStr.contains("batch")) return "batch";
+                        if (pathStr.contains("web")) return "web";
+                        if (pathStr.contains("core") || pathStr.contains("common")) return "common";
+                        return firstPart;
                     }
                 }
                 return "root";
@@ -297,14 +310,14 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
     private static String extractQueryString(J.Annotation annotation) {
         if (annotation.getArguments() == null) return null;
         for (Expression arg : annotation.getArguments()) {
-            if (arg instanceof J.Literal literal && literal.getValue() instanceof String s) {
-                return s;
-            }
             if (arg instanceof J.Assignment assign) {
-                if (assign.getVariable() instanceof J.Identifier id && ("value".equals(id.getSimpleName()) || "nativeQuery".equals(id.getSimpleName()))) {
+                if (assign.getVariable() instanceof J.Identifier id && "value".equals(id.getSimpleName())) {
                     String val = extractLiteralString(assign.getAssignment());
                     if (val != null) return val;
                 }
+            } else {
+                String val = extractLiteralString(arg);
+                if (val != null) return val;
             }
         }
         return null;

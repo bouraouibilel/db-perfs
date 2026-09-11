@@ -14,7 +14,7 @@ public interface UserRepository {
      * Requête commune joignant address et phone_contact.
      * Dans le batch, ni address ni phone_contact ne sont utilisés !
      */
-    @Query("SELECT u.id AS id, u.name AS name, a.city AS city, p.phoneNumber AS phoneNumber " +
+    /*~~([CANDIDAT_ELIMINATION] Jointure 'address' (LEFT JOIN) potentiellement inutile : aucune colonne référencée dans le code Java.)~~>*/@Query("SELECT u.id AS id, u.name AS name, a.city AS city, p.phoneNumber AS phoneNumber " +
            "FROM users u " +
            "LEFT JOIN address a ON u.address_id = a.id " +
            "LEFT JOIN phone_contact p ON u.phone_id = p.id")
@@ -24,7 +24,7 @@ public interface UserRepository {
      * Requête appelée par le contrôleur REST web-api.
      * themePreference n'est pas lu en Java, mais retourné directement en JSON !
      */
-    @Query("SELECT u.id AS id, u.name AS fullName, up.theme AS themePreference " +
+    /*~~([ATTENTION_WEB] Jointure 'user_preferences' (LEFT JOIN) dont les colonnes [themePreference] ne sont pas lues en Java, mais le type com.example.sample.dto.UserDirectoryDto est exposé sur une API Web (sérialisation JSON potentielle).)~~>*/@Query("SELECT u.id AS id, u.name AS fullName, up.theme AS themePreference " +
            "FROM users u " +
            "LEFT JOIN user_preferences up ON u.id = up.user_id")
     List<com.example.sample.dto.UserDirectoryDto> findUsersForApiDirectory();
