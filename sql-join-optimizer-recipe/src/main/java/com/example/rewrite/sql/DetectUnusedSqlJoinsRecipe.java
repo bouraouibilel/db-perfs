@@ -219,7 +219,7 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                                     join.tableName(), join.joinType());
                         }
 
-                        report.insertRow(ctx, new SqlJoinReport.Row(
+                        SqlJoinReport.Row row = new SqlJoinReport.Row(
                                 sourceFile,
                                 0,
                                 queryMetadata.methodName(),
@@ -229,7 +229,9 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                                 String.join(", ", unusedColNames),
                                 message,
                                 queryMetadata.rawQuery()
-                        ));
+                        );
+                        report.insertRow(ctx, row);
+                        exportReportToConsoleAndFile(row);
 
                         md = SearchResult.found(md, "[" + status + "] " + message);
                     }
@@ -238,6 +240,57 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                 return md;
             }
         };
+    }
+
+    private static synchronized void exportReportToConsoleAndFile(SqlJoinReport.Row row) {
+        // 1. Affichage console immédiat
+        System.out.println(String.format(
+            "\n[SQL-JOIN-OPTIMIZER] ----------------------------------------------------" +
+            "\n  Statut   : [%s]" +
+            "\n  Methode  : %s" +
+            "\n  Table    : %s (%s)" +
+            "\n  Colonnes : %s" +
+            "\n  Conseil  : %s" +
+            "\n------------------------------------------------------------------------",
+            row.status(), row.queryMethod(), row.joinTable(), row.joinType(),
+            row.unusedColumns().isBlank() ? "(aucune)" : row.unusedColumns(),
+            row.message()
+        ));
+
+        // 2. Export automatique dans target/sql-optimization-report.md et .csv
+        try {
+            java.nio.file.Path targetDir = java.nio.file.Path.of("target");
+            java.nio.file.Files.createDirectories(targetDir);
+
+            java.nio.file.Path mdPath = targetDir.resolve("sql-optimization-report.md");
+            boolean mdExists = java.nio.file.Files.exists(mdPath);
+            StringBuilder mdContent = new StringBuilder();
+            if (!mdExists) {
+                mdContent.append("# Rapport d'optimisation des requêtes SQL et Jointures\n\n");
+                mdContent.append("| Méthode | Table jointe | Type | Colonnes orphelines | Statut | Recommandation |\n");
+                mdContent.append("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+            }
+            mdContent.append(String.format("| `%s` | `%s` | %s | `%s` | **%s** | %s |\n",
+                    row.queryMethod(), row.joinTable(), row.joinType(),
+                    row.unusedColumns().isBlank() ? "-" : row.unusedColumns(),
+                    row.status(), row.message()));
+            java.nio.file.Files.writeString(mdPath, mdContent.toString(),
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+
+            java.nio.file.Path csvPath = targetDir.resolve("sql-optimization-report.csv");
+            boolean csvExists = java.nio.file.Files.exists(csvPath);
+            StringBuilder csvContent = new StringBuilder();
+            if (!csvExists) {
+                csvContent.append("Fichier,Methode,TableJointe,TypeJointe,ColonnesNonLues,Statut,Message\n");
+            }
+            csvContent.append(String.format("\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n",
+                    row.sourceFile(), row.queryMethod(), row.joinTable(), row.joinType(),
+                    row.unusedColumns(), row.status(), row.message().replace("\"", "'")));
+            java.nio.file.Files.writeString(csvPath, csvContent.toString(),
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+
+        } catch (Exception ignored) {
+        }
     }
 
     @Nullable
