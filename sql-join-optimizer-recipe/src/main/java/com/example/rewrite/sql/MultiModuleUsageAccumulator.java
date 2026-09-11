@@ -26,10 +26,24 @@ public class MultiModuleUsageAccumulator {
     public final Map<String, QueryMetadata> registeredQueries = new HashMap<>();
 
     /**
+     * Registre des NamedQueries par leur nom de requête (ex: "User.findSummaries")
+     */
+    public final Map<String, QueryMetadata> registeredNamedQueries = new HashMap<>();
+
+    /**
      * Modules appelant chaque requête.
      * Clé : FQN_Classe#nomMethode -> Ensemble de noms de modules ("batch-billing", "web-api", etc.)
      */
     public final Map<String, Set<String>> queryCallersByModule = new HashMap<>();
+
+    /**
+     * Modules appelant chaque NamedQuery par son nom.
+     * Clé : nom de la requête -> Ensemble de noms de modules ("batch-inscription", etc.)
+     */
+    public final Map<String, Set<String>> namedQueryCallersByModule = new HashMap<>();
+
+    public int scannedFileCount = 0;
+    public final Set<String> scannedModules = new TreeSet<>();
 
     public void registerInvocation(String typeFqn, String methodName) {
         if (typeFqn == null || methodName == null) return;
@@ -44,10 +58,17 @@ public class MultiModuleUsageAccumulator {
 
     public void registerQuery(QueryMetadata metadata) {
         registeredQueries.put(metadata.getFullQueryKey(), metadata);
+        if (metadata.getMethodName() != null) {
+            registeredNamedQueries.put(metadata.getMethodName(), metadata);
+        }
     }
 
     public void registerQueryCall(String queryKey, String callingModule) {
         queryCallersByModule.computeIfAbsent(queryKey, k -> new HashSet<>()).add(callingModule);
+    }
+
+    public void registerNamedQueryCall(String namedQueryName, String callingModule) {
+        namedQueryCallersByModule.computeIfAbsent(namedQueryName, k -> new HashSet<>()).add(callingModule);
     }
 
     /**

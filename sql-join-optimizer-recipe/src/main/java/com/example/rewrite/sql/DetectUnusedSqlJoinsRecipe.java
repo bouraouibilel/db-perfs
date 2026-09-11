@@ -43,6 +43,27 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
     }
 
     @Override
+    public Collection<? extends SourceFile> generate(MultiModuleUsageAccumulator acc, ExecutionContext ctx) {
+        System.out.println("\n[SQL-JOIN-OPTIMIZER] ========================================================");
+        System.out.println("[SQL-JOIN-OPTIMIZER]                BILAN DU SCAN MULTI-MODULES             ");
+        System.out.println("[SQL-JOIN-OPTIMIZER] ========================================================");
+        System.out.println("  Modules scannés    : " + (acc.scannedModules.isEmpty() ? "aucun" : acc.scannedModules));
+        System.out.println("  Fichiers analysés  : " + acc.scannedFileCount);
+        System.out.println("  Requêtes détectées : " + acc.registeredQueries.size());
+        if (acc.registeredQueries.isEmpty()) {
+            System.out.println("  (!) ATTENTION : Aucune requête (@Query ou @NamedQuery) trouvée dans les fichiers scannés.");
+            System.out.println("      Vérifiez que le profil Maven contenant vos entités/repositories/DAO");
+            System.out.println("      (ex: 'commun', 'services-metier', 'entities') est bien inclus dans votre commande avec -P !");
+        } else {
+            for (QueryMetadata q : acc.registeredQueries.values()) {
+                System.out.println("   * " + q.getFullQueryKey() + " [module: " + q.sourceModule() + "]");
+            }
+        }
+        System.out.println("[SQL-JOIN-OPTIMIZER] ========================================================\n");
+        return Collections.emptyList();
+    }
+
+    @Override
     public TreeVisitor<?, ExecutionContext> getScanner(MultiModuleUsageAccumulator acc) {
         return new JavaIsoVisitor<ExecutionContext>() {
 
@@ -63,6 +84,13 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                     }
                 }
                 return "root";
+            }
+
+            @Override
+            public J.CompilationUnit visitCompilationUnit(J.CompilationUnit cu, ExecutionContext ctx) {
+                acc.scannedFileCount++;
+                acc.scannedModules.add(resolveModuleName());
+                return super.visitCompilationUnit(cu, ctx);
             }
 
             // 1. Détection des contrôleurs REST / Web
@@ -88,7 +116,64 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                         }
                     }
                 }
+
+                // Détection des @NamedQuery / @NamedNativeQuery sur les classes/interfaces
+                for (J.Annotation annotation : cd.getLeadingAnnotations()) {
+                    scanForNamedQueries(annotation, cd);
+                }
+
                 return cd;
+            }
+
+            private void scanForNamedQueries(J.Annotation annotation, J.ClassDeclaration cd) {
+                String simpleName = annotation.getSimpleName();
+                if ("NamedQuery".equals(simpleName) || "NamedNativeQuery".equals(simpleName)) {
+                    registerNamedQueryAnnotation(annotation, cd);
+                } else if ("NamedQueries".equals(simpleName) || "NamedNativeQueries".equals(simpleName)) {
+                    if (annotation.getArguments() != null) {
+                        for (Expression arg : annotation.getArguments()) {
+                            if (arg instanceof J.NewArray) {
+                                J.NewArray array = (J.NewArray) arg;
+                                if (array.getInitializer() != null) {
+                                    for (Expression elem : array.getInitializer()) {
+                                        if (elem instanceof J.Annotation) {
+                                            scanForNamedQueries((J.Annotation) elem, cd);
+                                        }
+                                    }
+                                }
+                            } else if (arg instanceof J.Annotation) {
+                                scanForNamedQueries((J.Annotation) arg, cd);
+                            }
+                        }
+                    }
+                }
+            }
+
+            private void registerNamedQueryAnnotation(J.Annotation annotation, J.ClassDeclaration cd) {
+                String queryName = extractAnnotationAttribute(annotation, "name");
+                String sql = extractAnnotationAttribute(annotation, "query");
+                if (sql == null) {
+                    sql = extractAnnotationAttribute(annotation, "value");
+                }
+
+                if (sql != null && cd.getType() != null) {
+                    String declaringClassFqn = cd.getType().getFullyQualifiedName();
+                    String keyName = (queryName != null && !queryName.isBlank()) ? queryName : "NamedQuery_" + annotation.getId();
+                    String moduleName = resolveModuleName();
+                    SourceFile sf = getCursor().firstEnclosing(SourceFile.class);
+                    String sourcePath = sf != null ? sf.getSourcePath().toString() : "";
+
+                    QueryMetadata queryMetadata = new QueryMetadata(
+                            sql,
+                            declaringClassFqn, // Par défaut la classe entité portant le NamedQuery
+                            declaringClassFqn,
+                            keyName,
+                            moduleName,
+                            sourcePath,
+                            0
+                    );
+                    acc.registerQuery(queryMetadata);
+                }
             }
 
             // 2. Détection des méthodes de repository avec @Query
@@ -135,6 +220,15 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
 
                     String queryKey = declaringTypeFqn + "#" + methodName;
                     acc.registerQueryCall(queryKey, resolveModuleName());
+
+                    // Support EntityManager.createNamedQuery("nomRequete", ...)
+                    if ("createNamedQuery".equals(methodName) && m.getArguments() != null && !m.getArguments().isEmpty()) {
+                        Expression firstArg = m.getArguments().get(0);
+                        String namedQueryName = extractLiteralString(firstArg);
+                        if (namedQueryName != null) {
+                            acc.registerNamedQueryCall(namedQueryName, resolveModuleName());
+                        }
+                    }
                 }
                 return m;
             }
@@ -146,36 +240,79 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
         return new JavaIsoVisitor<ExecutionContext>() {
 
             @Override
-            public J.MethodDeclaration visitMethodDeclaration(J.MethodDeclaration method, ExecutionContext ctx) {
-                J.MethodDeclaration md = super.visitMethodDeclaration(method, ctx);
-                if (md.getMethodType() == null || md.getMethodType().getDeclaringType() == null) {
-                    return md;
+            public J.ClassDeclaration visitClassDeclaration(J.ClassDeclaration classDecl, ExecutionContext ctx) {
+                J.ClassDeclaration cd = super.visitClassDeclaration(classDecl, ctx);
+                if (cd.getType() == null) {
+                    return cd;
                 }
 
-                String queryKey = md.getMethodType().getDeclaringType().getFullyQualifiedName() + "#" + md.getSimpleName();
-                QueryMetadata queryMetadata = acc.registeredQueries.get(queryKey);
-                if (queryMetadata == null) {
-                    return md;
+                String declaringClassFqn = cd.getType().getFullyQualifiedName();
+                for (J.Annotation annotation : cd.getLeadingAnnotations()) {
+                    cd = processNamedQueryAnnotationOnClass(annotation, declaringClassFqn, cd, ctx);
                 }
+                return cd;
+            }
 
+            private J.ClassDeclaration processNamedQueryAnnotationOnClass(J.Annotation annotation, String declaringClassFqn, J.ClassDeclaration cd, ExecutionContext ctx) {
+                String simpleName = annotation.getSimpleName();
+                if ("NamedQuery".equals(simpleName) || "NamedNativeQuery".equals(simpleName)) {
+                    String queryName = extractAnnotationAttribute(annotation, "name");
+                    String key = (queryName != null && !queryName.isBlank()) ? queryName : declaringClassFqn;
+                    QueryMetadata qm = acc.registeredNamedQueries.get(key);
+                    if (qm == null) {
+                        qm = acc.registeredQueries.get(declaringClassFqn + "#" + key);
+                    }
+                    if (qm != null) {
+                        cd = analyzeAndMarkQuery(qm, cd, ctx);
+                    }
+                } else if ("NamedQueries".equals(simpleName) || "NamedNativeQueries".equals(simpleName)) {
+                    if (annotation.getArguments() != null) {
+                        for (Expression arg : annotation.getArguments()) {
+                            if (arg instanceof J.NewArray) {
+                                J.NewArray array = (J.NewArray) arg;
+                                if (array.getInitializer() != null) {
+                                    for (Expression elem : array.getInitializer()) {
+                                        if (elem instanceof J.Annotation) {
+                                            cd = processNamedQueryAnnotationOnClass((J.Annotation) elem, declaringClassFqn, cd, ctx);
+                                        }
+                                    }
+                                }
+                            } else if (arg instanceof J.Annotation) {
+                                cd = processNamedQueryAnnotationOnClass((J.Annotation) arg, declaringClassFqn, cd, ctx);
+                            }
+                        }
+                    }
+                }
+                return cd;
+            }
+
+            private <T extends J> T analyzeAndMarkQuery(QueryMetadata queryMetadata, T targetAstNode, ExecutionContext ctx) {
                 Optional<JoinAnalysisResult> analysisOpt = SqlSelectAnalyzer.analyze(queryMetadata.rawQuery());
                 if (analysisOpt.isEmpty()) {
-                    return md;
+                    return targetAstNode;
                 }
 
                 JoinAnalysisResult analysis = analysisOpt.get();
                 if (analysis.joins().isEmpty()) {
-                    return md;
+                    return targetAstNode;
                 }
 
                 String returnTypeFqn = queryMetadata.returnTypeFqn();
                 boolean isExposedInWeb = acc.typesExposedInWebControllers.contains(returnTypeFqn);
-                Set<String> callingModules = acc.queryCallersByModule.getOrDefault(queryKey, Collections.emptySet());
+
+                Set<String> callingModules = new HashSet<>();
+                Set<String> byMethod = acc.queryCallersByModule.get(queryMetadata.getFullQueryKey());
+                if (byMethod != null) callingModules.addAll(byMethod);
+                Set<String> byName = acc.namedQueryCallersByModule.get(queryMetadata.getMethodName());
+                if (byName != null) callingModules.addAll(byName);
+
                 boolean hasBatchCaller = callingModules.stream().anyMatch(m -> m.toLowerCase().contains("batch"));
                 boolean hasWebCaller = callingModules.stream().anyMatch(m -> m.toLowerCase().contains("web")) || isExposedInWeb;
 
                 SourceFile sf = getCursor().firstEnclosing(SourceFile.class);
                 String sourceFile = sf != null ? sf.getSourcePath().toString() : queryMetadata.sourcePath();
+
+                T resultNode = targetAstNode;
 
                 for (JoinedTableInfo join : analysis.joins()) {
                     String tableAliasOrName = join.getEffectiveIdentifier();
@@ -247,11 +384,26 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                         report.insertRow(ctx, row);
                         exportReportToConsoleAndFile(row);
 
-                        md = SearchResult.found(md, "[" + status + "] " + message);
+                        resultNode = SearchResult.found(resultNode, "[" + status + "] " + message);
                     }
                 }
+                return resultNode;
+            }
 
-                return md;
+            @Override
+            public J.MethodDeclaration visitMethodDeclaration(J.MethodDeclaration method, ExecutionContext ctx) {
+                J.MethodDeclaration md = super.visitMethodDeclaration(method, ctx);
+                if (md.getMethodType() == null || md.getMethodType().getDeclaringType() == null) {
+                    return md;
+                }
+
+                String queryKey = md.getMethodType().getDeclaringType().getFullyQualifiedName() + "#" + md.getSimpleName();
+                QueryMetadata queryMetadata = acc.registeredQueries.get(queryKey);
+                if (queryMetadata == null) {
+                    return md;
+                }
+
+                return analyzeAndMarkQuery(queryMetadata, md, ctx);
             }
         };
     }
@@ -303,6 +455,26 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
 
         } catch (Exception ignored) {
         }
+    }
+
+    @Nullable
+    private static String extractAnnotationAttribute(J.Annotation annotation, String attributeName) {
+        if (annotation.getArguments() == null) return null;
+        for (Expression arg : annotation.getArguments()) {
+            if (arg instanceof J.Assignment) {
+                J.Assignment assign = (J.Assignment) arg;
+                if (assign.getVariable() instanceof J.Identifier) {
+                    J.Identifier id = (J.Identifier) assign.getVariable();
+                    if (attributeName.equals(id.getSimpleName())) {
+                        return extractLiteralString(assign.getAssignment());
+                    }
+                }
+            } else if ("value".equals(attributeName) || "query".equals(attributeName)) {
+                String val = extractLiteralString(arg);
+                if (val != null) return val;
+            }
+        }
+        return null;
     }
 
     @Nullable

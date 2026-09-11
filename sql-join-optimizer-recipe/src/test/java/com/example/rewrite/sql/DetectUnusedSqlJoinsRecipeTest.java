@@ -286,4 +286,71 @@ class DetectUnusedSqlJoinsRecipeTest implements RewriteTest {
             )
         );
     }
+
+    @Test
+    void shouldDetectUnusedJoinInNamedQueryOnEntity() {
+        rewriteRun(
+            // Entity avec NamedQuery
+            java(
+                """
+                package com.example.model;
+
+                @NamedQuery(
+                    name = "User.findWithUnusedAddress",
+                    query = "SELECT u.id AS id, u.name AS name, a.city AS city FROM users u LEFT JOIN address a ON u.address_id = a.id"
+                )
+                public class User {
+                    private Long id;
+                    private String name;
+                    private String city;
+
+                    public Long getId() { return id; }
+                    public String getName() { return name; }
+                    public String getCity() { return city; }
+                }
+
+                @interface NamedQuery {
+                    String name();
+                    String query();
+                }
+                """,
+                """
+                package com.example.model;
+
+                /*~~([CANDIDAT_ELIMINATION] Jointure 'address' (LEFT JOIN) potentiellement inutile : aucune colonne référencée dans le code Java.)~~>*/@NamedQuery(
+                    name = "User.findWithUnusedAddress",
+                    query = "SELECT u.id AS id, u.name AS name, a.city AS city FROM users u LEFT JOIN address a ON u.address_id = a.id"
+                )
+                public class User {
+                    private Long id;
+                    private String name;
+                    private String city;
+
+                    public Long getId() { return id; }
+                    public String getName() { return name; }
+                    public String getCity() { return city; }
+                }
+
+                @interface NamedQuery {
+                    String name();
+                    String query();
+                }
+                """
+            ),
+            // Consommateur n'appelant que getId et getName
+            java(
+                """
+                package com.example.service;
+                import com.example.model.User;
+
+                public class UserService {
+                    public void handle(User user) {
+                        System.out.println(user.getId() + " " + user.getName());
+                    }
+                }
+                """
+            )
+        );
+    }
 }
+
