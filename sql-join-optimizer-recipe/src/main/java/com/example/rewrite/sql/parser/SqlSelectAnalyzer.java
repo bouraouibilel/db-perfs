@@ -22,13 +22,14 @@ public class SqlSelectAnalyzer {
         try {
             String cleanSql = sql.trim();
             Statement statement = CCJSqlParserUtil.parse(cleanSql);
-            if (!(statement instanceof Select select)) {
+            if (!(statement instanceof Select)) {
                 return Optional.empty();
             }
+            Select select = (Select) statement;
 
             PlainSelect plainSelect;
-            if (select.getSelectBody() instanceof PlainSelect ps) {
-                plainSelect = ps;
+            if (select.getSelectBody() instanceof PlainSelect) {
+                plainSelect = (PlainSelect) select.getSelectBody();
             } else {
                 return Optional.empty();
             }
@@ -36,7 +37,8 @@ public class SqlSelectAnalyzer {
             // 1. Table principale (FROM)
             String mainTableName = "";
             String mainTableAlias = "";
-            if (plainSelect.getFromItem() instanceof Table mainTable) {
+            if (plainSelect.getFromItem() instanceof Table) {
+                Table mainTable = (Table) plainSelect.getFromItem();
                 mainTableName = mainTable.getName();
                 if (mainTable.getAlias() != null) {
                     mainTableAlias = mainTable.getAlias().getName();
@@ -47,7 +49,8 @@ public class SqlSelectAnalyzer {
             List<JoinedTableInfo> joins = new ArrayList<>();
             if (plainSelect.getJoins() != null) {
                 for (Join join : plainSelect.getJoins()) {
-                    if (join.getRightItem() instanceof Table joinedTable) {
+                    if (join.getRightItem() instanceof Table) {
+                        Table joinedTable = (Table) join.getRightItem();
                         String tName = joinedTable.getName();
                         String tAlias = joinedTable.getAlias() != null ? joinedTable.getAlias().getName() : "";
                         String joinType = formatJoinType(join);
@@ -81,7 +84,8 @@ public class SqlSelectAnalyzer {
                     }
 
                     Expression expr = item.getExpression();
-                    if (expr instanceof Column col) {
+                    if (expr instanceof Column) {
+                        Column col = (Column) expr;
                         String colName = col.getColumnName();
                         String tableOrAlias = col.getTable() != null ? col.getTable().getName() : "";
                         if (targetPropName == null) {
@@ -92,15 +96,15 @@ public class SqlSelectAnalyzer {
                 }
             }
 
-            // 4. Tables / Alias référencés dans les filtres, tris et regroupements (WHERE, HAVING, GROUP BY, ORDER BY)
+            // 4. Tables / Alias référencés dans les filtres, tris et regroupements
             Set<String> tablesUsedInFilters = new HashSet<>();
             collectColumnsFromExpression(plainSelect.getWhere(), tablesUsedInFilters);
             collectColumnsFromExpression(plainSelect.getHaving(), tablesUsedInFilters);
 
             if (plainSelect.getGroupBy() != null && plainSelect.getGroupBy().getGroupByExpressionList() != null) {
                 for (Object item : plainSelect.getGroupBy().getGroupByExpressionList()) {
-                    if (item instanceof Expression expr) {
-                        collectColumnsFromExpression(expr, tablesUsedInFilters);
+                    if (item instanceof Expression) {
+                        collectColumnsFromExpression((Expression) item, tablesUsedInFilters);
                     }
                 }
             }
@@ -120,7 +124,6 @@ public class SqlSelectAnalyzer {
             ));
 
         } catch (Throwable t) {
-            // Requête SQL non parsable (ex: dialecte spécifique ou JPQL complexe)
             return Optional.empty();
         }
     }

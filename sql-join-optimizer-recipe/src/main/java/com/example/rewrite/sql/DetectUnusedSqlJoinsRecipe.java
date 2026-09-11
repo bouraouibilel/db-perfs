@@ -14,13 +14,13 @@ import org.openrewrite.marker.SearchResult;
 
 import java.nio.file.Path;
 import java.util.*;
+import java.util.stream.Collectors;
 
 public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageAccumulator> {
 
     private final transient SqlJoinReport report = new SqlJoinReport(this);
 
     public DetectUnusedSqlJoinsRecipe() {
-        System.out.println("[SQL-JOIN-OPTIMIZER] Recipe constructor invoked");
     }
 
     public SqlJoinReport getReport() {
@@ -39,7 +39,6 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
 
     @Override
     public MultiModuleUsageAccumulator getInitialValue(ExecutionContext ctx) {
-        System.out.println("[SQL-JOIN-OPTIMIZER] getInitialValue invoked");
         return new MultiModuleUsageAccumulator();
     }
 
@@ -77,11 +76,14 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
 
                 if (isWebController && cd.getBody() != null) {
                     for (Statement stmt : cd.getBody().getStatements()) {
-                        if (stmt instanceof J.MethodDeclaration md && md.getMethodType() != null) {
-                            JavaType returnType = md.getMethodType().getReturnType();
-                            String fqn = unwrapGenericType(returnType);
-                            if (fqn != null) {
-                                acc.registerControllerExposedType(fqn);
+                        if (stmt instanceof J.MethodDeclaration) {
+                            J.MethodDeclaration md = (J.MethodDeclaration) stmt;
+                            if (md.getMethodType() != null) {
+                                JavaType returnType = md.getMethodType().getReturnType();
+                                String fqn = unwrapGenericType(returnType);
+                                if (fqn != null) {
+                                    acc.registerControllerExposedType(fqn);
+                                }
                             }
                         }
                     }
@@ -187,14 +189,13 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
                             .anyMatch(other -> other.tablesMentionedInOnCondition().contains(tableAliasOrName));
 
                     if (isUsedInFilters || isUsedInOtherJoinOn) {
-                        // La jointure participe au filtrage ou est requise par une autre table
                         continue;
                     }
 
                     // Récupérer les colonnes projetées de cette table
                     List<ProjectedColumn> tableColumns = analysis.projectedColumns().stream()
                             .filter(c -> c.tableOrAlias().equalsIgnoreCase(tableAliasOrName))
-                            .toList();
+                            .collect(Collectors.toList());
 
                     // Vérifier si au moins une colonne de cette table est lue dans le code Java
                     List<String> unusedColNames = new ArrayList<>();
@@ -256,7 +257,6 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
     }
 
     private static synchronized void exportReportToConsoleAndFile(SqlJoinReport.Row row) {
-        // 1. Affichage console immédiat
         System.out.println(String.format(
             "\n[SQL-JOIN-OPTIMIZER] ----------------------------------------------------" +
             "\n  Statut   : [%s]" +
@@ -270,7 +270,6 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
             row.message()
         ));
 
-        // 2. Export automatique dans target/sql-optimization-report.md et .csv
         try {
             java.nio.file.Path targetDir = java.nio.file.Path.of("target");
             java.nio.file.Files.createDirectories(targetDir);
@@ -310,10 +309,13 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
     private static String extractQueryString(J.Annotation annotation) {
         if (annotation.getArguments() == null) return null;
         for (Expression arg : annotation.getArguments()) {
-            if (arg instanceof J.Assignment assign) {
-                if (assign.getVariable() instanceof J.Identifier id && "value".equals(id.getSimpleName())) {
-                    String val = extractLiteralString(assign.getAssignment());
-                    if (val != null) return val;
+            if (arg instanceof J.Assignment) {
+                J.Assignment assign = (J.Assignment) arg;
+                if (assign.getVariable() instanceof J.Identifier) {
+                    J.Identifier id = (J.Identifier) assign.getVariable();
+                    if ("value".equals(id.getSimpleName())) {
+                        return extractLiteralString(assign.getAssignment());
+                    }
                 }
             } else {
                 String val = extractLiteralString(arg);
@@ -325,14 +327,20 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
 
     @Nullable
     private static String extractLiteralString(Expression expr) {
-        if (expr instanceof J.Literal literal && literal.getValue() instanceof String s) {
-            return s;
+        if (expr instanceof J.Literal) {
+            J.Literal literal = (J.Literal) expr;
+            if (literal.getValue() instanceof String) {
+                return (String) literal.getValue();
+            }
         }
-        if (expr instanceof J.Binary binary && binary.getOperator() == J.Binary.Type.Addition) {
-            String left = extractLiteralString(binary.getLeft());
-            String right = extractLiteralString(binary.getRight());
-            if (left != null && right != null) {
-                return left + right;
+        if (expr instanceof J.Binary) {
+            J.Binary binary = (J.Binary) expr;
+            if (binary.getOperator() == J.Binary.Type.Addition) {
+                String left = extractLiteralString(binary.getLeft());
+                String right = extractLiteralString(binary.getRight());
+                if (left != null && right != null) {
+                    return left + right;
+                }
             }
         }
         return null;
@@ -341,12 +349,13 @@ public class DetectUnusedSqlJoinsRecipe extends ScanningRecipe<MultiModuleUsageA
     @Nullable
     private static String unwrapGenericType(@Nullable JavaType type) {
         if (type == null) return null;
-        if (type instanceof JavaType.Parameterized parameterized) {
+        if (type instanceof JavaType.Parameterized) {
+            JavaType.Parameterized parameterized = (JavaType.Parameterized) type;
             if (!parameterized.getTypeParameters().isEmpty()) {
-                // Déballe List<T>, Optional<T>, ResponseEntity<T>, Page<T>
                 return unwrapGenericType(parameterized.getTypeParameters().get(0));
             }
-        } else if (type instanceof JavaType.Class clazz) {
+        } else if (type instanceof JavaType.Class) {
+            JavaType.Class clazz = (JavaType.Class) type;
             return clazz.getFullyQualifiedName();
         }
         return null;
